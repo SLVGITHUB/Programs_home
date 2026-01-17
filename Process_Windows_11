@@ -1,0 +1,817 @@
+import psutil
+import time
+import ctypes
+from ctypes import wintypes
+import threading
+import queue
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import os
+import sys
+
+
+class ProcessMonitorGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Windows 11 Process Monitor")
+        self.root.geometry("1300x750")
+
+        # Переменные состояния
+        self.active_pid = None
+        self.running = True
+        self.paused = False
+        self.update_interval = 1000  # мс
+
+        # Очереди для межпоточной коммуникации
+        self.process_queue = queue.Queue(maxsize=100)
+        self.active_pid_queue = queue.Queue(maxsize=10)
+
+        # Кэш процессов
+        self.processes = {}
+
+        # Семафор для контроля обновлений
+        self.update_lock = threading.Lock()
+
+        # Настройка стилей
+        self.setup_styles()
+
+        # Создание интерфейса
+        self.create_widgets()
+
+        # Запуск рабочих потоков
+        self.start_worker_threads()
+
+        # Запуск периодического обновления
+        self.schedule_update()
+
+        # Обработка закрытия окна
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # Счетчик обновлений для отладки
+        self.update_count = 0
+
+    def setup_styles(self):
+        """Настройка стилей для интерфейса"""
+        style = ttk.Style()
+        style.theme_use('clam')
+
+        # Цветовая схема
+        self.tree_colors = {
+            'active': '#d4edda',  # Светло-зеленый для активного процесса
+            'system': '#fff3cd',  # Светло-желтый для системных
+            'high_cpu': '#f8d7da',  # Светло-красный для высокого CPU
+            'high_mem': '#ffeaa7',  # Светло-оранжевый для высокой памяти
+            'normal': '#ffffff',  # Белый для обычных
+        }
+
+        # Стилизация Treeview
+        style.configure('Treeview',
+                        rowheight=25,
+                        font=('Segoe UI', 10),
+                        background='white',
+                        fieldbackground='white')
+
+        style.configure('Treeview.Heading',
+                        font=('Segoe UI', 10, 'bold'),
+                        background='#0078d7',
+                        foreground='white')
+
+        style.map('Treeview',
+                  background=[('selected', '#0078d7')],
+                  foreground=[('selected', 'white')])
+
+    def create_widgets(self):
+        """Создание всех элементов интерфейса"""
+        # Главный контейнер с padding
+        main_container = ttk.Frame(self.root, padding="5")
+        main_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # Настройка весов
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_container.columnconfigure(0, weight=1)
+        main_container.rowconfigure(3, weight=1)
+
+        # Верхняя панель заголовка
+        header_frame = ttk.Frame(main_container)
+        header_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        ttk.Label(header_frame,
+                  text="🖥️ Windows 11 Process Monitor",
+                  font=('Segoe UI', 16, 'bold'),
+                  foreground='#0078d7').pack(side=tk.LEFT)
+
+        # Панель быстрых действий
+        quick_actions_frame = ttk.Frame(main_container)
+        quick_actions_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        # Кнопки действий
+        action_buttons = [
+            ("🔄 Обновить", self.manual_update, '#28a745'),
+            ("⏸️ Пауза", self.toggle_pause, '#ffc107'),
+            ("🔍 Поиск", self.search_process, '#17a2b8'),
+            ("❌ Завершить", self.kill_process, '#dc3545'),
+            ("📊 Детали", self.show_details, '#6f42c1'),
+        ]
+
+        for text, command, color in action_buttons:
+            btn = tk.Button(quick_actions_frame,
+                            text=text,
+                            command=command,
+                            bg=color,
+                            fg='white',
+                            font=('Segoe UI', 10),
+                            relief='flat',
+                            padx=12,
+                            pady=6,
+                            cursor='hand2')
+            btn.pack(side=tk.LEFT, padx=3)
+            btn.bind("<Enter>", lambda e, b=btn: b.configure(bg='#0056b3'))
+            btn.bind("<Leave>", lambda e, b=btn, c=color: b.configure(bg=c))
+
+        # Панель информации о системе
+        info_frame = ttk.LabelFrame(main_container, text="Системная информация", padding="10")
+        info_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        # Создаем сетку для меток
+        self.active_label = ttk.Label(info_frame, text="Активное окно: Не определено")
+        self.active_label.grid(row=0, column=0, sticky=tk.W, padx=10)
+
+        self.stats_label = ttk.Label(info_frame, text="Процессов: 0 | CPU: 0% | Память: 0 MB")
+        self.stats_label.grid(row=0, column=1, sticky=tk.W, padx=10)
+
+        self.time_label = ttk.Label(info_frame, text="Обновлено: --:--:--")
+        self.time_label.grid(row=0, column=2, sticky=tk.W, padx=10)
+
+        # Настройка интервала
+        ttk.Label(info_frame, text="Интервал (мс):").grid(row=0, column=3, sticky=tk.W, padx=(20, 5))
+
+        self.interval_var = tk.StringVar(value="1000")
+        interval_combo = ttk.Combobox(info_frame,
+                                      textvariable=self.interval_var,
+                                      values=["250", "500", "1000", "2000", "3000"],
+                                      width=8,
+                                      state="readonly")
+        interval_combo.grid(row=0, column=4, sticky=tk.W, padx=5)
+        interval_combo.bind('<<ComboboxSelected>>', self.change_interval)
+
+        # Основная таблица процессов
+        table_frame = ttk.LabelFrame(main_container, text="Список процессов", padding="5")
+        table_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
+        # Создание Treeview
+        columns = ('PID', 'Имя процесса', 'Пользователь', 'CPU %', 'Память (MB)',
+                   'Потоки', 'Состояние', 'Время запуска')
+
+        self.tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=18)
+
+        # Настройка колонок с оптимальными размерами
+        col_configs = [
+            ('PID', 70),
+            ('Имя процесса', 250),
+            ('Пользователь', 120),
+            ('CPU %', 70),
+            ('Память (MB)', 100),
+            ('Потоки', 70),
+            ('Состояние', 90),
+            ('Время запуска', 130),
+        ]
+
+        for col, width in col_configs:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=width, minwidth=50, anchor='center')
+
+        # Полосы прокрутки
+        v_scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        h_scrollbar = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+
+        # Размещение элементов таблицы
+        self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        v_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        h_scrollbar.grid(row=1, column=0, sticky=(tk.W, tk.E))
+
+        # Панель деталей процесса
+        detail_frame = ttk.LabelFrame(main_container, text="Детальная информация", padding="10")
+        detail_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+
+        self.detail_text = scrolledtext.ScrolledText(detail_frame,
+                                                     height=5,
+                                                     wrap=tk.WORD,
+                                                     font=('Consolas', 9))
+        self.detail_text.pack(fill=tk.BOTH, expand=True)
+
+        # Привязка событий
+        self.tree.bind('<<TreeviewSelect>>', self.on_process_select)
+        self.tree.bind('<Double-Button-1>', self.show_process_details)
+
+        # Статус бар внизу окна
+        self.status_var = tk.StringVar(value="Готов к работе")
+        status_bar = ttk.Label(main_container,
+                               textvariable=self.status_var,
+                               relief=tk.SUNKEN,
+                               anchor=tk.W,
+                               font=('Segoe UI', 9))
+        status_bar.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
+
+    def start_worker_threads(self):
+        """Запуск фоновых потоков для сбора данных"""
+        # Поток для мониторинга активного окна
+        self.active_monitor_thread = threading.Thread(
+            target=self.monitor_active_window,
+            daemon=True,
+            name="ActiveWindowMonitor"
+        )
+        self.active_monitor_thread.start()
+
+        # Поток для сбора информации о процессах
+        self.process_collector_thread = threading.Thread(
+            target=self.collect_processes,
+            daemon=True,
+            name="ProcessCollector"
+        )
+        self.process_collector_thread.start()
+
+    def monitor_active_window(self):
+        """Фоновый поток для отслеживания активного окна"""
+        while self.running:
+            try:
+                if not self.paused:
+                    pid = self.get_active_window()
+                    if pid is not None:
+                        try:
+                            self.active_pid_queue.put_nowait(pid)
+                        except queue.Full:
+                            pass  # Пропускаем если очередь полная
+                time.sleep(0.1)  # Частота проверки 10 Гц
+            except Exception as e:
+                print(f"Ошибка в мониторе активного окна: {e}")
+                time.sleep(1)
+
+    def collect_processes(self):
+        """Фоновый поток для сбора информации о процессах"""
+        batch_size = 50  # Обрабатываем по 50 процессов за раз
+        last_full_update = 0
+
+        while self.running:
+            try:
+                if self.paused:
+                    time.sleep(0.5)
+                    continue
+
+                current_time = time.time()
+
+                # Полное обновление каждые 2 секунды
+                if current_time - last_full_update > 2.0:
+                    self.update_status("Сбор данных о процессах...")
+                    processes_batch = []
+
+                    # Быстро собираем все PID
+                    try:
+                        all_pids = psutil.pids()[:200]  # Ограничиваем для скорости
+                    except:
+                        time.sleep(1)
+                        continue
+
+                    # Собираем информацию порциями
+                    for i, pid in enumerate(all_pids):
+                        if not self.running or self.paused:
+                            break
+
+                        try:
+                            proc_info = self.get_quick_process_info(pid)
+                            if proc_info:
+                                processes_batch.append(proc_info)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            continue
+
+                        # Отправляем порциями для избежания блокировки
+                        if len(processes_batch) >= batch_size or i == len(all_pids) - 1:
+                            if processes_batch:
+                                try:
+                                    self.process_queue.put_nowait(('batch', processes_batch.copy()))
+                                except queue.Full:
+                                    pass
+                                processes_batch.clear()
+
+                    last_full_update = current_time
+                    self.update_status("Данные собраны")
+
+                time.sleep(0.1)  # Небольшая пауза между циклами
+
+            except Exception as e:
+                print(f"Ошибка в сборщике процессов: {e}")
+                time.sleep(1)
+
+    def get_active_window(self):
+        """Быстрое получение PID активного окна"""
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if hwnd:
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                return pid.value
+        except:
+            pass
+        return None
+
+    def get_quick_process_info(self, pid):
+        """Быстрое получение основной информации о процессе"""
+        try:
+            with self.update_lock:
+                process = psutil.Process(pid)
+
+                # Минимальный набор информации для скорости
+                info = {
+                    'pid': pid,
+                    'name': process.name(),
+                    'cpu_percent': process.cpu_percent(interval=0),
+                    'memory_mb': process.memory_info().rss / 1048576,
+                    'threads': process.num_threads(),
+                    'status': process.status(),
+                }
+
+                # Быстрая проверка пользователя (может быть медленной)
+                try:
+                    username = process.username()
+                    if username and '\\' in username:
+                        username = username.split('\\')[-1]
+                    info['username'] = username[:15] if username else 'SYSTEM'
+                    info['is_system'] = 'SYSTEM' in (username or '').upper()
+                except:
+                    info['username'] = 'N/A'
+                    info['is_system'] = False
+
+                # Время создания
+                try:
+                    info['create_time'] = datetime.fromtimestamp(
+                        process.create_time()
+                    ).strftime('%H:%M:%S')
+                except:
+                    info['create_time'] = 'N/A'
+
+                return info
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return None
+
+    def schedule_update(self):
+        """Планирование обновления GUI из основного потока"""
+        if not self.running:
+            return
+
+        # Обработка обновлений активного PID
+        try:
+            while True:
+                pid = self.active_pid_queue.get_nowait()
+                self.active_pid = pid
+                self.update_active_label(pid)
+        except queue.Empty:
+            pass
+
+        # Обработка обновлений процессов
+        try:
+            while True:
+                msg_type, data = self.process_queue.get_nowait()
+                if msg_type == 'batch' and not self.paused:
+                    self.processes.update({p['pid']: p for p in data})
+                    self.update_treeview()
+                    self.update_statistics()
+                    self.update_count += 1
+        except queue.Empty:
+            pass
+
+        # Обновляем время
+        current_time = datetime.now().strftime('%H:%M:%S')
+        self.time_label.config(text=f"Обновлено: {current_time}")
+
+        # Планируем следующее обновление
+        self.root.after(100, self.schedule_update)  # Частота обновления GUI 10 Гц
+
+    def update_active_label(self, pid):
+        """Обновить метку активного окна"""
+        if pid:
+            proc = self.processes.get(pid)
+            if proc:
+                self.active_label.config(
+                    text=f"Активное окно: PID {pid} ({proc['name']})"
+                )
+            else:
+                self.active_label.config(
+                    text=f"Активное окно: PID {pid}"
+                )
+
+    def update_treeview(self):
+        """Обновить Treeview с процессами (вызывается в основном потоке)"""
+        # Ограничиваем частоту обновлений Treeview
+        if not hasattr(self, '_last_tree_update'):
+            self._last_tree_update = 0
+
+        current_time = time.time()
+        if current_time - self._last_tree_update < 0.5:  # Не чаще 2 Гц
+            return
+
+        self._last_tree_update = current_time
+
+        try:
+            # Запоминаем текущее выделение
+            selection = self.tree.selection()
+            selected_pid = None
+            if selection:
+                item = self.tree.item(selection[0])
+                selected_pid = item['values'][0] if item['values'] else None
+
+            # Очищаем Treeview
+            self.tree.delete(*self.tree.get_children())
+
+            # Сортируем процессы по CPU
+            sorted_procs = sorted(self.processes.values(),
+                                  key=lambda x: x.get('cpu_percent', 0),
+                                  reverse=True)
+
+            # Добавляем процессы в Treeview с ограничением
+            for proc in sorted_procs[:100]:  # Показываем только топ-100
+                values = (
+                    proc['pid'],
+                    proc['name'][:40],
+                    proc.get('username', 'N/A')[:15],
+                    f"{proc.get('cpu_percent', 0):.1f}",
+                    f"{proc.get('memory_mb', 0):.1f}",
+                    proc.get('threads', 0),
+                    proc.get('status', 'N/A'),
+                    proc.get('create_time', 'N/A'),
+                )
+
+                # Определяем теги для стилизации
+                tags = []
+                if proc['pid'] == self.active_pid:
+                    tags.append('active')
+                if proc.get('is_system', False):
+                    tags.append('system')
+                if proc.get('cpu_percent', 0) > 30:
+                    tags.append('high_cpu')
+                if proc.get('memory_mb', 0) > 200:
+                    tags.append('high_mem')
+
+                if not tags:
+                    tags.append('normal')
+
+                # Вставляем строку
+                item_id = self.tree.insert('', 'end', values=values, tags=tags)
+
+                # Настраиваем цвета для тегов
+                for tag in tags:
+                    color = self.tree_colors.get(tag, '#ffffff')
+                    self.tree.tag_configure(tag, background=color)
+
+            # Восстанавливаем выделение
+            if selected_pid:
+                for child in self.tree.get_children():
+                    item_values = self.tree.item(child)['values']
+                    if item_values and item_values[0] == selected_pid:
+                        self.tree.selection_set(child)
+                        self.tree.see(child)
+                        break
+
+            # Обновляем статус
+            self.status_var.set(f"Отображается {len(sorted_procs[:100])} из {len(sorted_procs)} процессов")
+
+        except Exception as e:
+            print(f"Ошибка при обновлении Treeview: {e}")
+
+    def update_statistics(self):
+        """Обновить статистику (вызывается в основном потоке)"""
+        try:
+            total = len(self.processes)
+            if total == 0:
+                return
+
+            # Быстрый расчет статистики
+            total_cpu = 0
+            total_memory = 0
+            system_count = 0
+
+            for proc in self.processes.values():
+                total_cpu += proc.get('cpu_percent', 0)
+                total_memory += proc.get('memory_mb', 0)
+                if proc.get('is_system', False):
+                    system_count += 1
+
+            self.stats_label.config(
+                text=f"Процессов: {total} | "
+                     f"Системных: {system_count} | "
+                     f"CPU: {total_cpu:.1f}% | "
+                     f"Память: {total_memory:.1f} MB"
+            )
+
+        except Exception as e:
+            print(f"Ошибка при обновлении статистики: {e}")
+
+    def update_status(self, message):
+        """Обновить статусную строку из фонового потока"""
+
+        def update():
+            self.status_var.set(message)
+
+        self.root.after(0, update)
+
+    def on_process_select(self, event):
+        """Обработка выбора процесса в таблице"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        item = self.tree.item(selection[0])
+        values = item['values']
+
+        if values:
+            pid = values[0]
+            proc = self.processes.get(pid)
+
+            if proc:
+                detail_text = f"""
+PID: {proc['pid']}
+Имя процесса: {proc['name']}
+Пользователь: {proc.get('username', 'N/A')}
+CPU: {proc.get('cpu_percent', 0):.1f}%
+Память: {proc.get('memory_mb', 0):.1f} MB
+Потоки: {proc.get('threads', 0)}
+Состояние: {proc.get('status', 'N/A')}
+Время запуска: {proc.get('create_time', 'N/A')}
+Тип: {'Системный' if proc.get('is_system', False) else 'Пользовательский'}
+                """
+
+                self.detail_text.delete(1.0, tk.END)
+                self.detail_text.insert(1.0, detail_text.strip())
+
+    def show_process_details(self, event):
+        """Показать детальное окно о процессе"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        item = self.tree.item(selection[0])
+        pid = item['values'][0]
+
+        # Запускаем в отдельном потоке для избежания зависания
+        thread = threading.Thread(
+            target=self.load_detailed_info,
+            args=(pid,),
+            daemon=True
+        )
+        thread.start()
+
+    def load_detailed_info(self, pid):
+        """Загрузка детальной информации о процессе (в фоне)"""
+        try:
+            process = psutil.Process(pid)
+
+            # Собираем полную информацию
+            info = {
+                'pid': pid,
+                'name': process.name(),
+                'exe': process.exe() or 'N/A',
+                'cmdline': ' '.join(process.cmdline()) if process.cmdline() else 'N/A',
+                'username': process.username() or 'N/A',
+                'cpu_percent': process.cpu_percent(interval=0.1),
+                'memory_percent': process.memory_percent(),
+                'memory_mb': process.memory_info().rss / 1048576,
+                'threads': process.num_threads(),
+                'status': process.status(),
+                'create_time': datetime.fromtimestamp(process.create_time()).strftime('%Y-%m-%d %H:%M:%S'),
+                'nice': process.nice(),
+                'ppid': process.ppid(),
+            }
+
+            # Отображаем в основном потоке
+            self.root.after(0, lambda: self.show_detail_window(info))
+
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror(
+                "Ошибка",
+                f"Не удалось загрузить детальную информацию: {str(e)}"
+            ))
+
+    def show_detail_window(self, info):
+        """Показать окно с детальной информацией"""
+        detail_window = tk.Toplevel(self.root)
+        detail_window.title(f"Детали процесса: {info['name']} (PID: {info['pid']})")
+        detail_window.geometry("600x500")
+
+        # Делаем окно поверх основного
+        detail_window.transient(self.root)
+        detail_window.grab_set()
+
+        # Создаем текст с прокруткой
+        text_frame = ttk.Frame(detail_window, padding="10")
+        text_frame.pack(fill=tk.BOTH, expand=True)
+
+        text_widget = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, font=('Consolas', 10))
+        text_widget.pack(fill=tk.BOTH, expand=True)
+
+        # Формируем информацию
+        details = f"""
+{'=' * 60}
+ДЕТАЛЬНАЯ ИНФОРМАЦИЯ О ПРОЦЕССЕ
+{'=' * 60}
+
+ОСНОВНАЯ ИНФОРМАЦИЯ:
+  PID: {info['pid']}
+  Имя: {info['name']}
+  Родительский PID: {info['ppid']}
+  Пользователь: {info['username']}
+  Путь: {info['exe']}
+
+ПРОИЗВОДИТЕЛЬНОСТЬ:
+  CPU: {info['cpu_percent']:.1f}%
+  Память: {info['memory_mb']:.1f} MB ({info['memory_percent']:.1f}%)
+  Потоки: {info['threads']}
+  Приоритет: {info['nice']}
+
+СОСТОЯНИЕ:
+  Статус: {info['status']}
+  Время запуска: {info['create_time']}
+  Командная строка: {info['cmdline']}
+
+{'=' * 60}
+        """
+
+        text_widget.insert(1.0, details.strip())
+        text_widget.config(state=tk.DISABLED)
+
+        # Кнопка закрытия
+        ttk.Button(detail_window,
+                   text="Закрыть",
+                   command=detail_window.destroy).pack(pady=10)
+
+    def show_details(self):
+        """Показать детали выбранного процесса"""
+        selection = self.tree.selection()
+        if selection:
+            self.show_process_details(None)
+        else:
+            messagebox.showinfo("Информация", "Выберите процесс для просмотра деталей")
+
+    def manual_update(self):
+        """Ручное обновление"""
+        if not self.paused:
+            self.update_status("Ручное обновление...")
+            # Очищаем кэш для принудительного обновления
+            self.processes.clear()
+
+    def toggle_pause(self):
+        """Включить/выключить паузу"""
+        self.paused = not self.paused
+
+        if self.paused:
+            self.update_status("Пауза")
+            self.active_label.config(text="Активное окно: Пауза")
+        else:
+            self.update_status("Возобновлено")
+
+    def search_process(self):
+        """Быстрый поиск процесса"""
+        search_window = tk.Toplevel(self.root)
+        search_window.title("Поиск процесса")
+        search_window.geometry("400x300")
+
+        ttk.Label(search_window, text="Поиск по имени или PID:").pack(pady=10)
+
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_window, textvariable=search_var, width=30)
+        search_entry.pack(pady=10)
+        search_entry.focus()
+
+        result_text = scrolledtext.ScrolledText(search_window, height=10, wrap=tk.WORD)
+        result_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        def perform_search():
+            query = search_var.get().strip().lower()
+            result_text.delete(1.0, tk.END)
+
+            if not query:
+                result_text.insert(1.0, "Введите запрос")
+                return
+
+            results = []
+            for pid, proc in self.processes.items():
+                try:
+                    if (query in str(pid) or
+                            query in proc['name'].lower() or
+                            (proc.get('username') and query in proc['username'].lower())):
+                        results.append(f"{pid:>6} | {proc['name']}")
+                except:
+                    continue
+
+            if results:
+                result_text.insert(1.0, f"Найдено: {len(results)}\n\n")
+                result_text.insert(tk.END, "\n".join(results))
+            else:
+                result_text.insert(1.0, "Не найдено")
+
+        ttk.Button(search_window, text="🔍 Найти", command=perform_search).pack(pady=10)
+        search_entry.bind('<Return>', lambda e: perform_search())
+
+    def kill_process(self):
+        """Завершить выбранный процесс"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Внимание", "Выберите процесс")
+            return
+
+        item = self.tree.item(selection[0])
+        pid = item['values'][0]
+        name = item['values'][1]
+
+        # Подтверждение
+        if not messagebox.askyesno("Подтверждение",
+                                   f"Завершить процесс?\nPID: {pid}\nИмя: {name}"):
+            return
+
+        # Завершение в отдельном потоке
+        thread = threading.Thread(
+            target=self.terminate_process,
+            args=(pid, name),
+            daemon=True
+        )
+        thread.start()
+
+    def terminate_process(self, pid, name):
+        """Завершить процесс (в фоновом потоке)"""
+        try:
+            process = psutil.Process(pid)
+            process.terminate()
+
+            # Сообщаем об успехе в основном потоке
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Успех",
+                f"Процесс '{name}' завершен"
+            ))
+
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror(
+                "Ошибка",
+                f"Не удалось завершить процесс: {str(e)}"
+            ))
+
+    def change_interval(self, event=None):
+        """Изменить интервал обновления"""
+        try:
+            new_interval = int(self.interval_var.get())
+            if 100 <= new_interval <= 5000:
+                self.update_interval = new_interval
+                self.update_status(f"Интервал обновления: {new_interval} мс")
+        except ValueError:
+            messagebox.showerror("Ошибка", "Некорректный интервал")
+
+    def on_closing(self):
+        """Обработка закрытия окна"""
+        self.running = False
+        self.paused = True
+
+        # Ждем завершения потоков
+        time.sleep(0.2)
+
+        # Закрываем окно
+        self.root.destroy()
+
+
+def main():
+    """Главная функция запуска приложения"""
+    # Проверка на Windows
+    if sys.platform != 'win32':
+        print("Эта программа работает только на Windows")
+        return
+
+    # Создание и запуск GUI
+    root = tk.Tk()
+
+    # Устанавливаем иконку (если есть)
+    try:
+        import ctypes
+        myappid = 'com.tron.processmonitor.1.0'
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except:
+        pass
+
+    # Создаем экземпляр приложения
+    app = ProcessMonitorGUI(root)
+
+    # Центрируем окно
+    root.update_idletasks()
+    width = root.winfo_width()
+    height = root.winfo_height()
+    x = (root.winfo_screenwidth() // 2) - (width // 2)
+    y = (root.winfo_screenheight() // 2) - (height // 2)
+    root.geometry(f'{width}x{height}+{x}+{y}')
+
+    # Запускаем главный цикл
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
